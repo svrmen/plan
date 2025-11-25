@@ -1410,13 +1410,48 @@
       }
     }
 
+    function requiresWallAttachment(type) {
+      return type === "socket" || type === "switch" || type === "panel";
+    }
+
+    function projectPointToSegment(a, b, p) {
+      const vx = b.x - a.x, vy = b.y - a.y;
+      const wx = p.x - a.x, wy = p.y - a.y;
+      const len2 = vx * vx + vy * vy || 1e-9;
+      let t = (vx * wx + vy * wy) / len2;
+      t = Math.max(0, Math.min(1, t));
+      return { x: a.x + t * vx, y: a.y + t * vy };
+    }
+
+    function snapToRoomWall(room, pt) {
+      if (!room || !room.pointsM || room.pointsM.length < 2) return pt;
+      let best = pt;
+      let bestDist = Infinity;
+      for (let i = 0; i < room.pointsM.length; i++) {
+        const a = room.pointsM[i];
+        const b = room.pointsM[(i + 1) % room.pointsM.length];
+        const proj = projectPointToSegment(a, b, pt);
+        const dist = Math.hypot(proj.x - pt.x, proj.y - pt.y);
+        if (dist < bestDist) {
+          bestDist = dist;
+          best = proj;
+        }
+      }
+      return best;
+    }
+
     function addSocketLike(ptM, type) {
       const room = findRoomContainingPoint(ptM);
       if (!room) { alert("Элемент можно ставить только внутри помещения."); return; }
+      const st = state.gridStepM;
+      let targetPt = { x: Math.round(ptM.x / st) * st, y: Math.round(ptM.y / st) * st };
+      if (requiresWallAttachment(type)) {
+        targetPt = snapToRoomWall(room, targetPt);
+      }
       const id = generateId(type);
       const socketObj = {
         id, type,
-        xM: ptM.x, yM: ptM.y,
+        xM: targetPt.x, yM: targetPt.y,
         name:
           (type === "switch" ? "Выключатель " :
            type === "cableout" ? "Вывод " :
@@ -1438,9 +1473,12 @@
     function addPanel(ptM) {
       const room = findRoomContainingPoint(ptM);
       if (!room) { alert("Щиток только внутри помещения."); return; }
+      const st = state.gridStepM;
+      const rounded = { x: Math.round(ptM.x / st) * st, y: Math.round(ptM.y / st) * st };
+      const targetPt = snapToRoomWall(room, rounded);
       const id = generateId("panel");
       const panelObj = {
-        id, xM: ptM.x, yM: ptM.y,
+        id, xM: targetPt.x, yM: targetPt.y,
         name: "Щиток " + id.split("_")[1],
         heightM: 1.5
       };
@@ -1679,41 +1717,69 @@
       return null;
     }
 
-    // Полный пересчёт всей линии (A1): каждый участок — манхэттен от from к to
-    function recalcLineManhattan(lineId) {
-      state.wires.forEach(w => {
-        if (w.lineId !== lineId) return;
-        const fromPt = getDeviceWorldPoint(w.fromType, w.fromId);
-        const toPt = getDeviceWorldPoint(w.toType, w.toId);
-        if (!fromPt || !toPt) return;
-        const pts = [];
-        pts.push({ x: fromPt.x, y: fromPt.y });
-        if (fromPt.x !== toPt.x && fromPt.y !== toPt.y) {
-          // L-образный маршрут (без диагоналей)
-          pts.push({ x: fromPt.x, y: toPt.y });
-        }
-        pts.push({ x: toPt.x, y: toPt.y });
-        w.pointsM = pts;
-        updateWirePolyline(w);
-      });
-      rebuildGroupsTable();
-      if (state.selected && state.selected.type === "wire") {
-        const wSel = findById("wire", state.selected.id);
-        if (wSel) {
-          wireLengthLabel.textContent = calcLineLength3D(wSel.lineId).toFixed(2);
+    function alignEndpointAlongAxis(points, idxToMove, neighborIdx, newPt, oldPt) {
+      if (!points[neighborIdx]) return;
+      const neighbor = points[neighborIdx];
+      const old = oldPt || points[idxToMove];
+      let orientation = "";
+      if (Math.abs(neighbor.x - old.x) < 1e-6) orientation = "v";
+      else if (Math.abs(neighbor.y - old.y) < 1e-6) orientation = "h";
+      points[idxToMove] = { x: newPt.x, y: newPt.y };
+      if (orientation === "v") {
+        neighbor.x = newPt.x;
+      } else if (orientation === "h") {
+        neighbor.y = newPt.y;
+      } else {
+        // исправляем случайные диагонали — тянем к ближайшей оси
+        if (Math.abs(neighbor.x - newPt.x) < Math.abs(neighbor.y - newPt.y)) {
+          neighbor.x = newPt.x;
+        } else {
+          neighbor.y = newPt.y;
         }
       }
     }
 
-    function recalcLinesForDevice(type, id) {
-      const lineIds = new Set();
+    function refreshSelectedWireLength() {
+      if (state.selected && state.selected.type === "wire") {
+        const wSel = findById("wire", state.selected.id);
+        if (wSel) wireLengthLabel.textContent = calcLineLength3D(wSel.lineId).toFixed(2);
+      }
+    }
+
+    function recalcLinesForDevice(type, id, oldPt) {
+      const st = state.gridStepM;
       state.wires.forEach(w => {
-        if ((w.fromType === type && w.fromId === id) ||
-            (w.toType === type && w.toId === id)) {
-          lineIds.add(w.lineId);
+        let changed = false;
+        if (w.fromType === type && w.fromId === id) {
+          const newStart = getDeviceWorldPoint(w.fromType, w.fromId);
+          const snappedStart = {
+            x: Math.round(newStart.x / st) * st,
+            y: Math.round(newStart.y / st) * st
+          };
+          if (w.pointsM.length > 0) {
+            alignEndpointAlongAxis(w.pointsM, 0, 1, snappedStart, oldPt);
+            changed = true;
+          }
+        }
+        if (w.toType === type && w.toId === id) {
+          const newEnd = getDeviceWorldPoint(w.toType, w.toId);
+          const snappedEnd = {
+            x: Math.round(newEnd.x / st) * st,
+            y: Math.round(newEnd.y / st) * st
+          };
+          if (w.pointsM.length > 0) {
+            const lastIdx = w.pointsM.length - 1;
+            const prevIdx = Math.max(0, lastIdx - 1);
+            alignEndpointAlongAxis(w.pointsM, lastIdx, prevIdx, snappedEnd, oldPt);
+            changed = true;
+          }
+        }
+        if (changed) {
+          updateWirePolyline(w);
         }
       });
-      lineIds.forEach(lineId => recalcLineManhattan(lineId));
+      rebuildGroupsTable();
+      refreshSelectedWireLength();
     }
 
     function handleDragMove(evt) {
@@ -1722,11 +1788,15 @@
       const obj = findById(type, id);
       if (!obj) return;
       const w = svgToWorld(evt);
+      const oldPt = { x: obj.xM, y: obj.yM };
       let newPt = { x: w.x + offsetXM, y: w.y + offsetYM };
       const st = state.gridStepM;
       newPt = { x: Math.round(newPt.x / st) * st, y: Math.round(newPt.y / st) * st };
       const room = findRoomContainingPoint(newPt);
       if (!room) return;
+      if (requiresWallAttachment(type)) {
+        newPt = snapToRoomWall(room, newPt);
+      }
       obj.xM = newPt.x;
       obj.yM = newPt.y;
       if (type === "socket") {
@@ -1737,7 +1807,7 @@
         obj.rectEl.setAttribute("y", s.y - 7);
       }
       // Пересчёт всех линий, связанных с этим устройством
-      recalcLinesForDevice(type, id);
+      recalcLinesForDevice(type, id, oldPt);
     }
     function stopDrag() { state.dragging = null; }
 
