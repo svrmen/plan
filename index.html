@@ -1699,11 +1699,14 @@
         });
     }
 
-    function repositionBoxesForWire(wire) {
+    function repositionBoxesForWire(wire, anchoredOnly = true) {
       const totalLen = calcPlanLength(wire.pointsM);
       if (!isFinite(totalLen) || totalLen <= 0) return;
       state.boxes
-        .filter(b => b.lineId === wire.lineId && (!b.wireId || b.wireId === wire.id))
+        .filter(b => {
+          if (anchoredOnly) return b.wireId === wire.id;
+          return b.lineId === wire.lineId && (!b.wireId || b.wireId === wire.id);
+        })
         .forEach(b => {
           const offset = (typeof b.linePosOffset === "number" && isFinite(b.linePosOffset))
             ? b.linePosOffset
