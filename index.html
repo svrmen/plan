@@ -264,6 +264,11 @@
       border-color: #2563eb;
     }
 
+    .muted {
+      color: #6b7280;
+      font-size: 11px;
+    }
+
     table {
       border-collapse: collapse;
       width: 100%;
@@ -283,6 +288,47 @@
 
     #groups-table-empty {
       font-size: 11px;
+      color: #6b7280;
+    }
+
+    .wire-handle {
+      fill: #ffffff;
+      stroke: #2563eb;
+      stroke-width: 1.5;
+      cursor: grab;
+    }
+
+    .wire-handle.dragging {
+      cursor: grabbing;
+      stroke: #1d4ed8;
+      fill: #eef2ff;
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      font-size: 12px;
+    }
+
+    .summary-card {
+      padding: 6px;
+      border-radius: 8px;
+      border: 1px solid #e5e7eb;
+      background: #f9fafb;
+    }
+
+    .summary-card h4 {
+      margin: 0 0 4px 0;
+      font-size: 12px;
+    }
+
+    .muted-sub {
+      color: #6b7280;
+      font-size: 11px;
+    }
+
+    .muted {
       color: #6b7280;
     }
 
@@ -312,6 +358,17 @@
         При клике по линии в режиме «Провод» можно подключиться к существующей линии через распредкоробку.<br />
         Двойной клик по розетке / щитку / линии — свойства.
       </div>
+    </div>
+
+    <div class="section">
+      <h2>План</h2>
+      <div class="toolbar">
+        <button class="btn" id="savePlanBtn">Скачать JSON</button>
+        <label class="btn" for="loadPlanInput" style="display:inline-flex;align-items:center;">Загрузить JSON</label>
+        <input type="file" id="loadPlanInput" accept="application/json" style="display:none;" />
+        <button class="btn" id="resetPlanBtn">Очистить</button>
+      </div>
+      <div class="muted">Сохраняй план, чтобы поделиться, или загружай сохранённый файл для продолжения.</div>
     </div>
 
     <div class="section">
@@ -440,6 +497,16 @@
           <div id="groups-table-empty">Пока нет ни одной линии.</div>
         </div>
       </div>
+      <div class="section">
+        <h2>Спецификация</h2>
+        <div class="prop-row">
+          <label>Запас на кабель, %</label>
+          <input type="number" id="sparePercentInput" min="0" max="100" step="1" value="0" />
+        </div>
+        <div id="spec-summary" class="summary-grid">
+          <div class="muted">Нет данных.</div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -546,13 +613,15 @@
       sockets: [],  // {id,xM,yM,name,heightM,powerKW,group,circleEl,extraEls,type:"socket"/"switch"/"cableout"/"light"}
       panels: [],   // {id,xM,yM,name,heightM,rectEl}
       wires: [],    // {id,lineId,pointsM,polylineEl,fromType,fromId,toType,toId,group,cable,section,cores}
-      boxes: [],    // {id,lineId,xM,yM,heightM,group,rectEl}
+      boxes: [],    // {id,lineId,xM,yM,heightM,group,rectEl,linePosRatio?,linePosOffset?,wireId?}
       nextId: 1,
       selected: null,
       roomDrawing: null,
       wireDrawing: null, // {lineId,fromType,fromId,pointsM,tempPolyline}
+      wireEdit: null,
       dragging: null,
-      panning: null
+      panning: null,
+      reservePercent: 0
     };
 
     const svg = document.getElementById("floorSvg");
@@ -584,6 +653,12 @@
     const wireCoresInput = document.getElementById("wireCoresInput");
     const wireLengthLabel = document.getElementById("wireLengthLabel");
     const groupsTable = document.getElementById("groups-table");
+    const specSummary = document.getElementById("spec-summary");
+    const sparePercentInput = document.getElementById("sparePercentInput");
+
+    const savePlanBtn = document.getElementById("savePlanBtn");
+    const loadPlanInput = document.getElementById("loadPlanInput");
+    const resetPlanBtn = document.getElementById("resetPlanBtn");
 
     // модалки
     const socketModalBackdrop = document.getElementById("socket-modal-backdrop");
@@ -618,6 +693,7 @@
       state.mode = mode;
       sidebarButtons.forEach(b => b.classList.toggle("active", b.dataset.mode === mode));
       state.wireDrawing = null;
+      clearWireEditMode();
       logDebug("Режим: " + mode);
     }
 
@@ -647,6 +723,390 @@
       const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
       Object.entries(attrs).forEach(([k, v]) => el.setAttribute(k, v));
       return el;
+    }
+
+    function resetPlanState() {
+      const cg = getContentGroup();
+      while (cg.firstChild) cg.removeChild(cg.firstChild);
+      state.rooms = [];
+      state.sockets = [];
+      state.panels = [];
+      state.wires = [];
+      state.boxes = [];
+      state.selected = null;
+      state.roomDrawing = null;
+      state.wireDrawing = null;
+      clearWireEditMode();
+      state.dragging = null;
+      state.panning = null;
+      state.nextId = 1;
+      state.scale = 80;
+      state.offsetX = 0;
+      state.offsetY = 0;
+      state.reservePercent = 0;
+      sparePercentInput.value = "0";
+      segmentUi.style.display = "none";
+      updateGridPattern();
+      rebuildAllSummaries();
+      renderSelectionPanel();
+      logDebug("План очищен.");
+    }
+
+    function getSocketVisualStyle(type) {
+      let baseRadius = 5;
+      let fill = "#ffffff";
+      let stroke = "#f97316";
+
+      if (type === "switch") {
+        baseRadius = 4;
+        fill = "#eef2ff";
+        stroke = "#6366f1";
+      } else if (type === "cableout") {
+        fill = "#e0f2fe";
+        stroke = "#0ea5e9";
+      } else if (type === "light") {
+        baseRadius = 6;
+        fill = "#ffffff";
+        stroke = "#22c55e";
+      }
+
+      return { baseRadius, fill, stroke };
+    }
+
+    function attachSocketDom(socketObj) {
+      const style = getSocketVisualStyle(socketObj.type);
+      const group = createSvgElement("g", {});
+      const sPt = worldToSvg({ x: socketObj.xM, y: socketObj.yM });
+      const circle = createSvgElement("circle", {
+        cx: sPt.x, cy: sPt.y, r: style.baseRadius,
+        fill: style.fill,
+        stroke: style.stroke,
+        "stroke-width": "1.5"
+      });
+      group.appendChild(circle);
+
+      const extraEls = [];
+      if (socketObj.type === "light") {
+        const d = 4;
+        const l1 = createSvgElement("line", {
+          x1: sPt.x - d, y1: sPt.y - d,
+          x2: sPt.x + d, y2: sPt.y + d,
+          stroke: style.stroke,
+          "stroke-width": "1"
+        });
+        const l2 = createSvgElement("line", {
+          x1: sPt.x - d, y1: sPt.y + d,
+          x2: sPt.x + d, y2: sPt.y - d,
+          stroke: style.stroke,
+          "stroke-width": "1"
+        });
+        group.appendChild(l1);
+        group.appendChild(l2);
+        extraEls.push(l1, l2);
+      } else if (socketObj.type === "switch") {
+        const d = 5;
+        const l = createSvgElement("line", {
+          x1: sPt.x - d, y1: sPt.y + d,
+          x2: sPt.x + d, y2: sPt.y - d,
+          stroke: style.stroke,
+          "stroke-width": "1"
+        });
+        group.appendChild(l);
+        extraEls.push(l);
+      }
+
+      socketObj.circleEl = circle;
+      socketObj.extraEls = extraEls;
+
+      group.addEventListener("mousedown", evt => {
+        if (evt.button === 1 || evt.button === 2) {
+          beginPanning(evt);
+          return;
+        }
+        evt.stopPropagation();
+        if (evt.button !== 0) return;
+        if (state.mode === "select") {
+          setSelectedGeneric("socket", socketObj);
+          startDrag("socket", socketObj, evt);
+        } else if (state.mode === "wire") {
+          wireDeviceClick(socketObj.type, socketObj);
+        }
+      });
+
+      group.addEventListener("dblclick", evt => {
+        evt.stopPropagation();
+        if (state.mode === "select") openSocketModal(socketObj);
+      });
+
+      getContentGroup().appendChild(group);
+    }
+
+    function attachPanelDom(panelObj) {
+      const sPt = worldToSvg({ x: panelObj.xM, y: panelObj.yM });
+      const rect = createSvgElement("rect", {
+        x: sPt.x - 7, y: sPt.y - 7, width: 14, height: 14,
+        rx: 2, ry: 2,
+        fill: "#eff6ff", stroke: "#2563eb", "stroke-width": "1.5"
+      });
+
+      rect.addEventListener("mousedown", evt => {
+        if (evt.button === 1 || evt.button === 2) {
+          beginPanning(evt);
+          return;
+        }
+        evt.stopPropagation();
+        if (evt.button !== 0) return;
+        if (state.mode === "select") {
+          setSelectedGeneric("panel", panelObj);
+          startDrag("panel", panelObj, evt);
+        } else if (state.mode === "wire") {
+          wireDeviceClick("panel", panelObj);
+        }
+      });
+
+      rect.addEventListener("dblclick", evt => {
+        evt.stopPropagation();
+        if (state.mode === "select") openPanelModal(panelObj);
+      });
+
+      panelObj.rectEl = rect;
+      getContentGroup().appendChild(rect);
+    }
+
+    function createRoomFromData(roomData) {
+      const polygon = createSvgElement("polygon", {
+        fill: "rgba(209, 250, 229, 0.4)", stroke: "#10b981", "stroke-width": "2"
+      });
+      const ptsStr = roomData.pointsM.map(p => {
+        const s = worldToSvg(p); return s.x + "," + s.y;
+      }).join(" ");
+      polygon.setAttribute("points", ptsStr);
+
+      let roomObj;
+      polygon.addEventListener("mousedown", evt => {
+        if (evt.button === 1 || evt.button === 2) {
+          beginPanning(evt);
+          return;
+        }
+        if (state.mode === "select") {
+          evt.stopPropagation();
+          setSelectedGeneric("room", roomObj);
+        }
+      });
+
+      const centroid = computePolygonCentroid(roomData.pointsM);
+      const labelPos = worldToSvg(centroid);
+      const textEl = createSvgElement("text", {
+        x: labelPos.x, y: labelPos.y,
+        "text-anchor": "middle",
+        "dominant-baseline": "middle",
+        "font-size": "12", fill: "#111827"
+      });
+      textEl.textContent = roomData.name || "Помещение";
+      textEl.addEventListener("mousedown", evt => {
+        if (evt.button === 1 || evt.button === 2) {
+          beginPanning(evt);
+          return;
+        }
+        if (state.mode === "select") {
+          evt.stopPropagation();
+          setSelectedGeneric("room", roomObj);
+        }
+      });
+
+      getContentGroup().appendChild(polygon);
+      getContentGroup().appendChild(textEl);
+
+      roomObj = {
+        id: roomData.id,
+        name: roomData.name || "Помещение",
+        heightM: roomData.heightM != null ? roomData.heightM : 2.5,
+        pointsM: roomData.pointsM.map(p => ({ x: p.x, y: p.y })),
+        polygonEl: polygon,
+        labelEl: textEl
+      };
+      state.rooms.push(roomObj);
+      updateRoomLabel(roomObj);
+      return roomObj;
+    }
+
+    function createSocketFromData(socketData) {
+      const socketObj = {
+        id: socketData.id,
+        type: socketData.type || "socket",
+        xM: socketData.xM,
+        yM: socketData.yM,
+        name: socketData.name || (socketData.type || "socket") + " " + socketData.id,
+        heightM: socketData.heightM,
+        powerKW: socketData.powerKW != null ? socketData.powerKW : null,
+        group: socketData.group || ""
+      };
+      attachSocketDom(socketObj);
+      state.sockets.push(socketObj);
+      return socketObj;
+    }
+
+    function createPanelFromData(panelData) {
+      const panelObj = {
+        id: panelData.id,
+        xM: panelData.xM,
+        yM: panelData.yM,
+        name: panelData.name || "Щиток",
+        heightM: panelData.heightM != null ? panelData.heightM : 1.5
+      };
+      attachPanelDom(panelObj);
+      state.panels.push(panelObj);
+      return panelObj;
+    }
+
+    function createBoxFromData(boxData) {
+      const s = worldToSvg({ x: boxData.xM, y: boxData.yM });
+      const rect = createSvgElement("rect", {
+        x: s.x - 4, y: s.y - 4, width: 8, height: 8,
+        rx: 1, ry: 1,
+        fill: "#bbf7d0", stroke: "#16a34a", "stroke-width": "1"
+      });
+      rect.addEventListener("mousedown", evt => {
+        if (evt.button === 1 || evt.button === 2) { beginPanning(evt); return; }
+        evt.stopPropagation();
+      });
+      getContentGroup().appendChild(rect);
+      const boxObj = {
+        id: boxData.id,
+        lineId: boxData.lineId,
+        xM: boxData.xM,
+        yM: boxData.yM,
+        heightM: boxData.heightM,
+        group: boxData.group || "",
+        linePosRatio: typeof boxData.linePosRatio === "number" ? boxData.linePosRatio : null,
+        linePosOffset: typeof boxData.linePosOffset === "number" ? boxData.linePosOffset : null,
+        wireId: boxData.wireId || null,
+        rectEl: rect
+      };
+      state.boxes.push(boxObj);
+      updateBoxGraphics(boxObj);
+      return boxObj;
+    }
+
+    function createWireFromData(wireData) {
+      const polyline = createSvgElement("polyline", {
+        fill: "none", stroke: "#111827", "stroke-width": "1.5"
+      });
+      const wireObj = {
+        id: wireData.id,
+        lineId: wireData.lineId,
+        fromType: wireData.fromType,
+        fromId: wireData.fromId,
+        toType: wireData.toType,
+        toId: wireData.toId,
+        pointsM: wireData.pointsM.map(p => ({ x: p.x, y: p.y })),
+        polylineEl: polyline,
+        group: wireData.group || "",
+        cable: wireData.cable || "ВВГнг-LS",
+        section: wireData.section || "",
+        cores: wireData.cores || ""
+      };
+      registerWirePolylineHandlers(wireObj);
+      updateWirePolyline(wireObj);
+      state.wires.push(wireObj);
+      return wireObj;
+    }
+
+    function computeNextIdFromData(data) {
+      const ids = [];
+      [data.rooms, data.sockets, data.panels, data.wires, data.boxes].forEach(arr => {
+        (arr || []).forEach(item => { if (item && item.id) ids.push(item.id); });
+      });
+      const maxNum = ids.reduce((max, id) => {
+        const parts = id.split("_");
+        const num = parseInt(parts[1], 10);
+        return isNaN(num) ? max : Math.max(max, num);
+      }, 0);
+      state.nextId = maxNum + 1;
+    }
+
+    function serializeState() {
+      return {
+        version: 1,
+        scale: state.scale,
+        offsetX: state.offsetX,
+        offsetY: state.offsetY,
+        gridStepM: state.gridStepM,
+        reservePercent: state.reservePercent,
+        rooms: state.rooms.map(r => ({
+          id: r.id,
+          name: r.name,
+          heightM: r.heightM,
+          pointsM: r.pointsM
+        })),
+        sockets: state.sockets.map(s => ({
+          id: s.id,
+          type: s.type,
+          xM: s.xM,
+          yM: s.yM,
+          name: s.name,
+          heightM: s.heightM,
+          powerKW: s.powerKW,
+          group: s.group
+        })),
+        panels: state.panels.map(p => ({
+          id: p.id,
+          xM: p.xM,
+          yM: p.yM,
+          name: p.name,
+          heightM: p.heightM
+        })),
+        boxes: state.boxes.map(b => ({
+          id: b.id,
+          lineId: b.lineId,
+          xM: b.xM,
+          yM: b.yM,
+          heightM: b.heightM,
+          group: b.group,
+          linePosRatio: b.linePosRatio,
+          linePosOffset: b.linePosOffset,
+          wireId: b.wireId
+        })),
+        wires: state.wires.map(w => ({
+          id: w.id,
+          lineId: w.lineId,
+          fromType: w.fromType,
+          fromId: w.fromId,
+          toType: w.toType,
+          toId: w.toId,
+          pointsM: w.pointsM,
+          group: w.group,
+          cable: w.cable,
+          section: w.section,
+          cores: w.cores
+        }))
+      };
+    }
+
+    function applySerializedState(data) {
+      resetPlanState();
+      if (typeof data.scale === "number") state.scale = data.scale;
+      if (typeof data.offsetX === "number") state.offsetX = data.offsetX;
+      if (typeof data.offsetY === "number") state.offsetY = data.offsetY;
+      if (typeof data.gridStepM === "number") state.gridStepM = data.gridStepM;
+      if (typeof data.reservePercent === "number") {
+        state.reservePercent = Math.max(0, Math.min(100, data.reservePercent));
+        sparePercentInput.value = state.reservePercent;
+      }
+
+      updateGridPattern();
+
+      (data.rooms || []).forEach(r => createRoomFromData(r));
+      (data.panels || []).forEach(p => createPanelFromData(p));
+      (data.sockets || []).forEach(s => createSocketFromData(s));
+      (data.boxes || []).forEach(b => createBoxFromData(b));
+      (data.wires || []).forEach(w => createWireFromData(w));
+      refreshBoxAnchorsFromGeometry();
+
+      computeNextIdFromData(data);
+      rebuildAllSummaries();
+      redrawAllGeometry();
+      logDebug("План загружен.");
     }
 
     function initSvg() {
@@ -698,6 +1158,7 @@
     }
 
     function clearSelection() {
+      clearWireEditMode();
       [...state.rooms, ...state.sockets, ...state.panels, ...state.wires, ...state.boxes].forEach(o => {
         if (o.polygonEl) o.polygonEl.classList.remove("selected-outline");
         if (o.circleEl) o.circleEl.classList.remove("selected-outline");
@@ -759,6 +1220,45 @@
         L += Math.sqrt(dx*dx + dy*dy);
       }
       return L;
+    }
+
+    function pointAtDistanceOnPolyline(pointsM, dist) {
+      let remaining = dist;
+      for (let i = 0; i < pointsM.length - 1; i++) {
+        const a = pointsM[i], b = pointsM[i + 1];
+        const segLen = Math.hypot(b.x - a.x, b.y - a.y);
+        if (segLen >= remaining) {
+          const t = segLen > 0 ? remaining / segLen : 0;
+          return { x: a.x + t * (b.x - a.x), y: a.y + t * (b.y - a.y) };
+        }
+        remaining -= segLen;
+      }
+      const last = pointsM[pointsM.length - 1];
+      return { x: last.x, y: last.y };
+    }
+
+    function projectPointOntoPolyline(pointsM, pt) {
+      let best = { x: pointsM[0].x, y: pointsM[0].y };
+      let bestDist = Infinity;
+      let bestDistAlong = 0;
+      let traveled = 0;
+      for (let i = 0; i < pointsM.length - 1; i++) {
+        const a = pointsM[i], b = pointsM[i + 1];
+        const vx = b.x - a.x, vy = b.y - a.y;
+        const wx = pt.x - a.x, wy = pt.y - a.y;
+        const len2 = vx * vx + vy * vy || 1e-9;
+        let t = (vx * wx + vy * wy) / len2;
+        t = Math.max(0, Math.min(1, t));
+        const proj = { x: a.x + t * vx, y: a.y + t * vy };
+        const d = Math.hypot(pt.x - proj.x, pt.y - proj.y);
+        if (d < bestDist) {
+          bestDist = d;
+          best = proj;
+          bestDistAlong = traveled + t * Math.sqrt(len2);
+        }
+        traveled += Math.sqrt(len2);
+      }
+      return { point: best, distanceAlong: bestDistAlong };
     }
 
     function findRoomContainingPoint(ptM) {
@@ -1022,74 +1522,73 @@
       }
     }
 
+    function updateBoxGraphics(boxObj) {
+      if (!boxObj.rectEl) return;
+      const q = worldToSvg({ x: boxObj.xM, y: boxObj.yM });
+      boxObj.rectEl.setAttribute("x", q.x - 4);
+      boxObj.rectEl.setAttribute("y", q.y - 4);
+    }
+
+    function requiresWallAttachment(type) {
+      return type === "socket" || type === "switch" || type === "panel" || type === "cableout";
+    }
+
+    function projectPointToSegment(a, b, p) {
+      const vx = b.x - a.x, vy = b.y - a.y;
+      const wx = p.x - a.x, wy = p.y - a.y;
+      const len2 = vx * vx + vy * vy || 1e-9;
+      let t = (vx * wx + vy * wy) / len2;
+      t = Math.max(0, Math.min(1, t));
+      return { x: a.x + t * vx, y: a.y + t * vy };
+    }
+
+    function findClosestEdgeIndex(room, pt) {
+      if (!room || !room.pointsM || room.pointsM.length < 2) return null;
+      let bestIdx = null;
+      let bestDist = Infinity;
+      for (let i = 0; i < room.pointsM.length; i++) {
+        const a = room.pointsM[i];
+        const b = room.pointsM[(i + 1) % room.pointsM.length];
+        const proj = projectPointToSegment(a, b, pt);
+        const dist = Math.hypot(proj.x - pt.x, proj.y - pt.y);
+        if (dist < bestDist) { bestDist = dist; bestIdx = i; }
+      }
+      return bestIdx;
+    }
+
+    function snapToRoomWall(room, pt, preferredEdgeIdx = null, lockEdge = false) {
+      if (!room || !room.pointsM || room.pointsM.length < 2) return pt;
+      if (preferredEdgeIdx != null && lockEdge) {
+        const a = room.pointsM[preferredEdgeIdx];
+        const b = room.pointsM[(preferredEdgeIdx + 1) % room.pointsM.length];
+        return projectPointToSegment(a, b, pt);
+      }
+      let best = pt;
+      let bestDist = Infinity;
+      for (let i = 0; i < room.pointsM.length; i++) {
+        const a = room.pointsM[i];
+        const b = room.pointsM[(i + 1) % room.pointsM.length];
+        const proj = projectPointToSegment(a, b, pt);
+        const dist = Math.hypot(proj.x - pt.x, proj.y - pt.y);
+        const bias = (preferredEdgeIdx != null && preferredEdgeIdx === i) ? 0.05 : 0;
+        if (dist - bias < bestDist) { bestDist = dist - bias; best = proj; }
+      }
+      return best;
+    }
+
     function addSocketLike(ptM, type) {
       const room = findRoomContainingPoint(ptM);
       if (!room) { alert("Элемент можно ставить только внутри помещения."); return; }
+      const st = state.gridStepM;
+      let targetPt = { x: Math.round(ptM.x / st) * st, y: Math.round(ptM.y / st) * st };
+      if (requiresWallAttachment(type)) {
+        const stickEdge = findClosestEdgeIndex(room, targetPt);
+        targetPt = snapToRoomWall(room, targetPt, stickEdge, true);
+      }
       const id = generateId(type);
-      const sPt = worldToSvg(ptM);
-
-      const group = createSvgElement("g", {});
-      let baseRadius = 5;
-      let fill = "#ffffff";
-      let stroke = "#f97316";
-
-      if (type === "switch") {
-        baseRadius = 4;
-        fill = "#eef2ff";
-        stroke = "#6366f1";
-      } else if (type === "cableout") {
-        fill = "#e0f2fe";
-        stroke = "#0ea5e9";
-      } else if (type === "light") {
-        baseRadius = 6;
-        fill = "#ffffff";
-        stroke = "#22c55e";
-      }
-
-      const circle = createSvgElement("circle", {
-        cx: sPt.x, cy: sPt.y, r: baseRadius,
-        fill: fill,
-        stroke: stroke,
-        "stroke-width": "1.5"
-      });
-      group.appendChild(circle);
-
-      const extraEls = [];
-
-      if (type === "light") {
-        // УГО светильника: круг с крестом
-        const d = 4;
-        const l1 = createSvgElement("line", {
-          x1: sPt.x - d, y1: sPt.y - d,
-          x2: sPt.x + d, y2: sPt.y + d,
-          stroke: stroke,
-          "stroke-width": "1"
-        });
-        const l2 = createSvgElement("line", {
-          x1: sPt.x - d, y1: sPt.y + d,
-          x2: sPt.x + d, y2: sPt.y - d,
-          stroke: stroke,
-          "stroke-width": "1"
-        });
-        group.appendChild(l1);
-        group.appendChild(l2);
-        extraEls.push(l1, l2);
-      } else if (type === "switch") {
-        // УГО выключателя: диагональная линия
-        const d = 5;
-        const l = createSvgElement("line", {
-          x1: sPt.x - d, y1: sPt.y + d,
-          x2: sPt.x + d, y2: sPt.y - d,
-          stroke: stroke,
-          "stroke-width": "1"
-        });
-        group.appendChild(l);
-        extraEls.push(l);
-      }
-
       const socketObj = {
         id, type,
-        xM: ptM.x, yM: ptM.y,
+        xM: targetPt.x, yM: targetPt.y,
         name:
           (type === "switch" ? "Выключатель " :
            type === "cableout" ? "Вывод " :
@@ -1101,77 +1600,34 @@
           type === "light" ? (room.heightM || 2.5) :
           0.3,
         powerKW: null,
-        group: "",
-        circleEl: circle,
-        extraEls
+        group: ""
       };
-
-      group.addEventListener("mousedown", evt => {
-        if (evt.button === 1 || evt.button === 2) {
-          beginPanning(evt);
-          return;
-        }
-        evt.stopPropagation();
-        if (evt.button !== 0) return;
-        if (state.mode === "select") {
-          setSelectedGeneric("socket", socketObj);
-          startDrag("socket", socketObj, evt);
-        } else if (state.mode === "wire") {
-          // клик по элементу в режиме провода
-          wireDeviceClick(type, socketObj);
-        }
-      });
-
-      group.addEventListener("dblclick", evt => {
-        evt.stopPropagation();
-        if (state.mode === "select") openSocketModal(socketObj);
-      });
-
-      getContentGroup().appendChild(group);
+      attachSocketDom(socketObj);
       state.sockets.push(socketObj);
       setSelectedGeneric("socket", socketObj);
+      rebuildAllSummaries();
     }
 
     function addPanel(ptM) {
       const room = findRoomContainingPoint(ptM);
       if (!room) { alert("Щиток только внутри помещения."); return; }
+      const st = state.gridStepM;
+      const rounded = { x: Math.round(ptM.x / st) * st, y: Math.round(ptM.y / st) * st };
+      const stickEdge = findClosestEdgeIndex(room, rounded);
+      const targetPt = snapToRoomWall(room, rounded, stickEdge, true);
       const id = generateId("panel");
-      const sPt = worldToSvg(ptM);
-      const rect = createSvgElement("rect", {
-        x: sPt.x - 7, y: sPt.y - 7, width: 14, height: 14,
-        rx: 2, ry: 2,
-        fill: "#eff6ff", stroke: "#2563eb", "stroke-width": "1.5"
-      });
       const panelObj = {
-        id, xM: ptM.x, yM: ptM.y,
+        id, xM: targetPt.x, yM: targetPt.y,
         name: "Щиток " + id.split("_")[1],
-        heightM: 1.5,
-        rectEl: rect
+        heightM: 1.5
       };
-      rect.addEventListener("mousedown", evt => {
-        if (evt.button === 1 || evt.button === 2) {
-          beginPanning(evt);
-          return;
-        }
-        evt.stopPropagation();
-        if (evt.button !== 0) return;
-        if (state.mode === "select") {
-          setSelectedGeneric("panel", panelObj);
-          startDrag("panel", panelObj, evt);
-        } else if (state.mode === "wire") {
-          wireDeviceClick("panel", panelObj);
-        }
-      });
-      rect.addEventListener("dblclick", evt => {
-        evt.stopPropagation();
-        if (state.mode === "select") openPanelModal(panelObj);
-      });
-      getContentGroup().appendChild(rect);
+      attachPanelDom(panelObj);
       state.panels.push(panelObj);
       setSelectedGeneric("panel", panelObj);
+      rebuildAllSummaries();
     }
 
-    function addBoxAtPoint(groupName, lineId, ptM) {
+    function addBoxAtPoint(groupName, lineId, ptM, anchorWire) {
       const id = generateId("box");
       const s = worldToSvg(ptM);
       const rect = createSvgElement("rect", {
@@ -1196,10 +1652,86 @@
         yM: ptM.y,
         heightM: roomH,
         group: groupName || "",
+        linePosRatio: null,
+        linePosOffset: null,
+        wireId: anchorWire ? anchorWire.id : null,
         rectEl: rect
       };
       state.boxes.push(boxObj);
+      if (anchorWire) {
+        attachBoxToWire(boxObj, anchorWire);
+      } else if (lineId) {
+        const lineWire = state.wires.find(w => w.id === boxObj.wireId) || state.wires.find(w => w.lineId === lineId);
+        if (lineWire) attachBoxToWire(boxObj, lineWire);
+      }
       return boxObj;
+    }
+
+    function snapToGrid(pt) {
+      const st = state.gridStepM;
+      return { x: Math.round(pt.x / st) * st, y: Math.round(pt.y / st) * st };
+    }
+
+    function attachBoxToWire(boxObj, wire) {
+      if (!wire || !wire.pointsM || wire.pointsM.length < 2) return;
+      const proj = projectPointOntoPolyline(wire.pointsM, { x: boxObj.xM, y: boxObj.yM });
+      const totalLen = Math.max(calcPlanLength(wire.pointsM), 1e-9);
+      const ratio = Math.max(0, Math.min(1, proj.distanceAlong / totalLen));
+      boxObj.linePosRatio = ratio;
+      boxObj.linePosOffset = proj.distanceAlong;
+      boxObj.wireId = wire.id;
+      boxObj.xM = proj.point.x;
+      boxObj.yM = proj.point.y;
+      updateBoxGraphics(boxObj);
+    }
+
+    function refreshBranchWiresForBox(boxObj) {
+      const st = state.gridStepM;
+      state.wires
+        .filter(w => (w.fromType === "box" && w.fromId === boxObj.id) || (w.toType === "box" && w.toId === boxObj.id))
+        .forEach(w => {
+          const isFrom = w.fromType === "box" && w.fromId === boxObj.id;
+          const idx = isFrom ? 0 : w.pointsM.length - 1;
+          const neighborIdx = isFrom ? 1 : Math.max(0, w.pointsM.length - 2);
+          const snapped = snapToGrid({ x: boxObj.xM, y: boxObj.yM });
+          alignEndpointAlongAxis(w.pointsM, idx, neighborIdx, snapped);
+          updateWirePolyline(w);
+        });
+    }
+
+    function repositionBoxesForWire(wire) {
+      const totalLen = calcPlanLength(wire.pointsM);
+      if (!isFinite(totalLen) || totalLen <= 0) return;
+      state.boxes
+        .filter(b => b.lineId === wire.lineId && (!b.wireId || b.wireId === wire.id))
+        .forEach(b => {
+          const offset = (typeof b.linePosOffset === "number" && isFinite(b.linePosOffset))
+            ? b.linePosOffset
+            : (b.linePosRatio != null ? b.linePosRatio * totalLen : 0);
+          const clamped = Math.max(0, Math.min(totalLen, offset));
+          const pt = pointAtDistanceOnPolyline(wire.pointsM, clamped);
+          b.xM = pt.x;
+          b.yM = pt.y;
+          b.wireId = wire.id;
+          b.linePosOffset = clamped;
+          b.linePosRatio = totalLen > 0 ? clamped / totalLen : 0;
+          updateBoxGraphics(b);
+          refreshBranchWiresForBox(b);
+        });
+    }
+
+    function refreshBoxAnchorsFromGeometry() {
+      state.boxes.forEach(box => {
+        const wire = box.wireId
+          ? state.wires.find(w => w.id === box.wireId)
+          : state.wires.find(w => w.lineId === box.lineId);
+        if (!wire) return;
+        if (box.linePosOffset == null && box.linePosRatio == null) {
+          attachBoxToWire(box, wire);
+        } else {
+          repositionBoxesForWire(wire);
+        }
+      });
     }
 
     // провода
@@ -1209,6 +1741,9 @@
         const s = worldToSvg(p); return s.x + "," + s.y;
       }).join(" ");
       wire.polylineEl.setAttribute("points", ptsStr);
+      if (state.wireEdit && state.wireEdit.wireId === wire.id) {
+        refreshWireHandlesPositions();
+      }
     }
 
     function updateTempWirePolyline() {
@@ -1274,7 +1809,7 @@
         state.wireDrawing = null;
         state.wires.push(wireObj);
         setSelectedWireLine(wireObj);
-        rebuildGroupsTable();
+        rebuildAllSummaries();
         logDebug("Провод создан, длина ≈ " + calcWireLength3D(wireObj).toFixed(2) + " м");
       }
     }
@@ -1314,7 +1849,7 @@
       const section = targetWire.section || "";
       const cores = targetWire.cores || "";
 
-      const box = addBoxAtPoint(group, lineId, ptOnWire);
+      const box = addBoxAtPoint(group, lineId, ptOnWire, targetWire);
 
       const polyline = createSvgElement("polyline", {
         fill: "none", stroke: "#111827", "stroke-width": "1.5"
@@ -1343,7 +1878,7 @@
       state.wireDrawing = null;
 
       setSelectedWireLine(newWire);
-      rebuildGroupsTable();
+      rebuildAllSummaries();
       logDebug("Создана ветка к существующей линии через распредкоробку, длина ≈ " + calcWireLength3D(newWire).toFixed(2) + " м");
     }
 
@@ -1368,8 +1903,70 @@
       });
       polyline.addEventListener("dblclick", evt => {
         evt.stopPropagation();
-        if (state.mode === "select") openWireModal(wireObj);
+        if (state.mode === "select") {
+          setSelectedWireLine(wireObj);
+          enterWireEditMode(wireObj);
+        }
       });
+    }
+
+    function clearWireEditMode() {
+      if (!state.wireEdit) return;
+      state.wireEdit.handles.forEach(h => h.el.remove());
+      state.wireEdit = null;
+    }
+
+    function refreshWireHandlesPositions() {
+      if (!state.wireEdit) return;
+      const wire = findById("wire", state.wireEdit.wireId);
+      if (!wire) { clearWireEditMode(); return; }
+      state.wireEdit.handles.forEach(h => {
+        const pt = wire.pointsM[h.index];
+        const s = worldToSvg(pt);
+        h.el.setAttribute("cx", s.x);
+        h.el.setAttribute("cy", s.y);
+      });
+    }
+
+    function enterWireEditMode(wireObj) {
+      clearWireEditMode();
+      const handles = [];
+      for (let i = 1; i < wireObj.pointsM.length - 1; i++) {
+        const pt = wireObj.pointsM[i];
+        const s = worldToSvg(pt);
+        const c = createSvgElement("circle", { cx: s.x, cy: s.y, r: 4.5, class: "wire-handle" });
+        c.addEventListener("mousedown", evt => {
+          if (evt.button === 1 || evt.button === 2) { beginPanning(evt); return; }
+          if (evt.button !== 0) return;
+          evt.stopPropagation();
+          state.wireEdit = state.wireEdit || { wireId: wireObj.id, handles, draggingIdx: null };
+          state.wireEdit.draggingIdx = i;
+          c.classList.add("dragging");
+        });
+        getContentGroup().appendChild(c);
+        handles.push({ index: i, el: c });
+      }
+      state.wireEdit = { wireId: wireObj.id, handles, draggingIdx: null };
+      if (handles.length === 0) {
+        logDebug("У линии нет точек для редактирования — добавьте промежуточные узлы при построении.");
+      }
+    }
+
+    function handleWireVertexDrag(evt) {
+      if (!state.wireEdit || state.wireEdit.draggingIdx == null) return;
+      const wire = findById("wire", state.wireEdit.wireId);
+      if (!wire) { clearWireEditMode(); return; }
+      const idx = state.wireEdit.draggingIdx;
+      if (idx <= 0 || idx >= wire.pointsM.length - 1) return;
+      const wPt = svgToWorld(evt);
+      const st = state.gridStepM;
+      const newPt = { x: Math.round(wPt.x / st) * st, y: Math.round(wPt.y / st) * st };
+      wire.pointsM[idx] = newPt;
+      updateWirePolyline(wire);
+      repositionBoxesForWire(wire);
+      refreshSelectedWireLength();
+      rebuildAllSummaries();
+      refreshWireHandlesPositions();
     }
 
     // перетаскивание
@@ -1378,7 +1975,10 @@
       state.dragging = {
         type, id: obj.id,
         offsetXM: obj.xM - w.x,
-        offsetYM: obj.yM - w.y
+        offsetYM: obj.yM - w.y,
+        preferredWallEdge: requiresWallAttachment(type)
+          ? findClosestEdgeIndex(findRoomContainingPoint({ x: obj.xM, y: obj.yM }), { x: obj.xM, y: obj.yM })
+          : null
       };
     }
 
@@ -1401,41 +2001,94 @@
       return null;
     }
 
-    // Полный пересчёт всей линии (A1): каждый участок — манхэттен от from к to
-    function recalcLineManhattan(lineId) {
-      state.wires.forEach(w => {
-        if (w.lineId !== lineId) return;
-        const fromPt = getDeviceWorldPoint(w.fromType, w.fromId);
-        const toPt = getDeviceWorldPoint(w.toType, w.toId);
-        if (!fromPt || !toPt) return;
-        const pts = [];
-        pts.push({ x: fromPt.x, y: fromPt.y });
-        if (fromPt.x !== toPt.x && fromPt.y !== toPt.y) {
-          // L-образный маршрут (без диагоналей)
-          pts.push({ x: fromPt.x, y: toPt.y });
-        }
-        pts.push({ x: toPt.x, y: toPt.y });
-        w.pointsM = pts;
-        updateWirePolyline(w);
-      });
-      rebuildGroupsTable();
-      if (state.selected && state.selected.type === "wire") {
-        const wSel = findById("wire", state.selected.id);
-        if (wSel) {
-          wireLengthLabel.textContent = calcLineLength3D(wSel.lineId).toFixed(2);
+    function alignEndpointAlongAxis(points, idxToMove, neighborIdx, newPt, oldPt) {
+      if (!points[neighborIdx]) return;
+      const neighbor = points[neighborIdx];
+      const old = oldPt || points[idxToMove];
+      let orientation = "";
+      if (Math.abs(neighbor.x - old.x) < 1e-6) orientation = "v";
+      else if (Math.abs(neighbor.y - old.y) < 1e-6) orientation = "h";
+      points[idxToMove] = { x: newPt.x, y: newPt.y };
+      if (orientation === "v") {
+        neighbor.x = newPt.x;
+      } else if (orientation === "h") {
+        neighbor.y = newPt.y;
+      } else {
+        // исправляем случайные диагонали — тянем к ближайшей оси
+        if (Math.abs(neighbor.x - newPt.x) < Math.abs(neighbor.y - newPt.y)) {
+          neighbor.x = newPt.x;
+        } else {
+          neighbor.y = newPt.y;
         }
       }
     }
 
-    function recalcLinesForDevice(type, id) {
-      const lineIds = new Set();
+    function refreshSelectedWireLength() {
+      if (state.selected && state.selected.type === "wire") {
+        const wSel = findById("wire", state.selected.id);
+        if (wSel) wireLengthLabel.textContent = calcLineLength3D(wSel.lineId).toFixed(2);
+      }
+    }
+
+    function moveAttachedBoxesWithDevice(type, id, delta) {
+      if (!delta || (Math.abs(delta.x) < 1e-9 && Math.abs(delta.y) < 1e-9)) return;
+      const moved = new Set();
       state.wires.forEach(w => {
-        if ((w.fromType === type && w.fromId === id) ||
-            (w.toType === type && w.toId === id)) {
-          lineIds.add(w.lineId);
+        let boxId = null;
+        if (w.fromType === type && w.fromId === id && w.toType === "box") boxId = w.toId;
+        if (w.toType === type && w.toId === id && w.fromType === "box") boxId = w.fromId;
+        if (!boxId || moved.has(boxId)) return;
+        const box = findById("box", boxId);
+        if (!box) return;
+        const newPos = snapToGrid({ x: box.xM + delta.x, y: box.yM + delta.y });
+        const room = findRoomContainingPoint(newPos);
+        if (!room) return;
+        const oldPt = { x: box.xM, y: box.yM };
+        box.xM = newPos.x;
+        box.yM = newPos.y;
+        updateBoxGraphics(box);
+        const anchorWire = box.wireId ? state.wires.find(x => x.id === box.wireId) : w;
+        if (anchorWire) attachBoxToWire(box, anchorWire);
+        recalcLinesForDevice("box", box.id, oldPt);
+        moved.add(boxId);
+      });
+    }
+
+    function recalcLinesForDevice(type, id, oldPt) {
+      const st = state.gridStepM;
+      state.wires.forEach(w => {
+        let changed = false;
+        if (w.fromType === type && w.fromId === id) {
+          const newStart = getDeviceWorldPoint(w.fromType, w.fromId);
+          const snappedStart = {
+            x: Math.round(newStart.x / st) * st,
+            y: Math.round(newStart.y / st) * st
+          };
+          if (w.pointsM.length > 0) {
+            alignEndpointAlongAxis(w.pointsM, 0, 1, snappedStart, oldPt);
+            changed = true;
+          }
+        }
+        if (w.toType === type && w.toId === id) {
+          const newEnd = getDeviceWorldPoint(w.toType, w.toId);
+          const snappedEnd = {
+            x: Math.round(newEnd.x / st) * st,
+            y: Math.round(newEnd.y / st) * st
+          };
+          if (w.pointsM.length > 0) {
+            const lastIdx = w.pointsM.length - 1;
+            const prevIdx = Math.max(0, lastIdx - 1);
+            alignEndpointAlongAxis(w.pointsM, lastIdx, prevIdx, snappedEnd, oldPt);
+            changed = true;
+          }
+        }
+        if (changed) {
+          updateWirePolyline(w);
+          repositionBoxesForWire(w);
         }
       });
-      lineIds.forEach(lineId => recalcLineManhattan(lineId));
+      rebuildAllSummaries();
+      refreshSelectedWireLength();
     }
 
     function handleDragMove(evt) {
@@ -1444,11 +2097,15 @@
       const obj = findById(type, id);
       if (!obj) return;
       const w = svgToWorld(evt);
+      const oldPt = { x: obj.xM, y: obj.yM };
       let newPt = { x: w.x + offsetXM, y: w.y + offsetYM };
       const st = state.gridStepM;
       newPt = { x: Math.round(newPt.x / st) * st, y: Math.round(newPt.y / st) * st };
       const room = findRoomContainingPoint(newPt);
       if (!room) return;
+      if (requiresWallAttachment(type)) {
+        newPt = snapToRoomWall(room, newPt, state.dragging.preferredWallEdge, true);
+      }
       obj.xM = newPt.x;
       obj.yM = newPt.y;
       if (type === "socket") {
@@ -1459,7 +2116,9 @@
         obj.rectEl.setAttribute("y", s.y - 7);
       }
       // Пересчёт всех линий, связанных с этим устройством
-      recalcLinesForDevice(type, id);
+      recalcLinesForDevice(type, id, oldPt);
+      const delta = { x: newPt.x - oldPt.x, y: newPt.y - oldPt.y };
+      moveAttachedBoxesWithDevice(type, id, delta);
     }
     function stopDrag() { state.dragging = null; }
 
@@ -1527,7 +2186,7 @@
       const r = findById("room", state.selected.id); if (!r) return;
       const v = parseFloat(roomHeightInput.value);
       if (!isNaN(v) && v > 0) r.heightM = v;
-      rebuildGroupsTable();
+      rebuildAllSummaries();
     });
 
     socketNameInput.addEventListener("input", () => {
@@ -1551,7 +2210,7 @@
       if (!state.selected || state.selected.type !== "wire") return;
       const w = findById("wire", state.selected.id); if (!w) return;
       updateLineProps(w.lineId, obj => obj.group = wireGroupInput.value);
-      rebuildGroupsTable();
+      rebuildAllSummaries();
     });
 
     // cable type — фиксируем как ВВГнг-LS через логику, поле только для отображения
@@ -1560,13 +2219,53 @@
       if (!state.selected || state.selected.type !== "wire") return;
       const w = findById("wire", state.selected.id); if (!w) return;
       updateLineProps(w.lineId, obj => obj.section = wireSectionInput.value);
-      rebuildGroupsTable();
+      rebuildAllSummaries();
     });
     wireCoresInput.addEventListener("change", () => {
       if (!state.selected || state.selected.type !== "wire") return;
       const w = findById("wire", state.selected.id); if (!w) return;
       updateLineProps(w.lineId, obj => obj.cores = wireCoresInput.value);
-      rebuildGroupsTable();
+      rebuildAllSummaries();
+    });
+
+    sparePercentInput.addEventListener("input", () => {
+      const v = parseFloat(sparePercentInput.value);
+      state.reservePercent = !isNaN(v) && v >= 0 ? Math.min(100, v) : 0;
+      rebuildSpecSummary();
+    });
+
+    savePlanBtn.addEventListener("click", () => {
+      const dataStr = JSON.stringify(serializeState(), null, 2);
+      const blob = new Blob([dataStr], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "plan.json";
+      a.click();
+      URL.revokeObjectURL(url);
+      logDebug("План сохранён в файл.");
+    });
+
+    loadPlanInput.addEventListener("change", evt => {
+      const file = evt.target.files && evt.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = e => {
+        try {
+          const data = JSON.parse(e.target.result);
+          applySerializedState(data);
+        } catch (err) {
+          alert("Не удалось прочитать файл: " + err.message);
+        }
+      };
+      reader.readAsText(file);
+      evt.target.value = "";
+    });
+
+    resetPlanBtn.addEventListener("click", () => {
+      if (confirm("Очистить текущий план?")) {
+        resetPlanState();
+      }
     });
 
     deleteLineBtn.addEventListener("click", () => {
@@ -1583,7 +2282,7 @@
         return true;
       });
       clearSelection();
-      rebuildGroupsTable();
+      rebuildAllSummaries();
       logDebug("Линия удалена.");
     });
 
@@ -1612,7 +2311,7 @@
       if (state.selected && state.selected.type === "socket" && state.selected.id === s.id) {
         socketNameInput.value = s.name;
       }
-      rebuildGroupsTable();
+      rebuildAllSummaries();
       closeSocketModal();
     });
     socketModalCancel.addEventListener("click", closeSocketModal);
@@ -1640,7 +2339,7 @@
       if (state.selected && state.selected.type === "panel" && state.selected.id === p.id) {
         panelNameInput.value = p.name;
       }
-      rebuildGroupsTable();
+      rebuildAllSummaries();
       closePanelModal();
     });
     panelModalCancel.addEventListener("click", closePanelModal);
@@ -1678,7 +2377,7 @@
         obj.section = section;
         obj.cores = cores;
       });
-      rebuildGroupsTable();
+      rebuildAllSummaries();
       if (state.selected && state.selected.type === "wire") {
         wireGroupInput.value = group;
         wireCableInput.value = cable;
@@ -1776,6 +2475,61 @@
       groupsTable.innerHTML = html;
     }
 
+    function rebuildSpecSummary() {
+      const reserve = Math.max(0, Math.min(100, Number(state.reservePercent) || 0));
+      sparePercentInput.value = reserve;
+
+      const socketsCount = state.sockets.filter(s => s.type === "socket").length;
+      const switchesCount = state.sockets.filter(s => s.type === "switch").length;
+      const lightsCount = state.sockets.filter(s => s.type === "light").length;
+      const cableoutsCount = state.sockets.filter(s => s.type === "cableout").length;
+      const boxesCount = state.boxes.length;
+      const panelsCount = state.panels.length;
+
+      const cables = {};
+      state.wires.forEach(w => {
+        const key = `${w.cable || "ВВГнг-LS"}|${w.section || ""}|${w.cores || ""}`;
+        if (!cables[key]) {
+          cables[key] = { cable: w.cable || "ВВГнг-LS", section: w.section || "", cores: w.cores || "", length: 0 };
+        }
+        cables[key].length += calcWireLength3D(w);
+      });
+
+      const reserveFactor = 1 + reserve / 100;
+      const totalCableNoReserve = Object.values(cables).reduce((sum, c) => sum + c.length, 0);
+      const totalCableWithReserve = totalCableNoReserve * reserveFactor;
+
+      const cableTable = Object.keys(cables).length === 0
+        ? '<div class="muted-sub">Кабели отсутствуют.</div>'
+        : `<table><thead><tr><th>Марка / сечение</th><th>Длина, м</th><th>С запасом, м</th></tr></thead><tbody>${Object.values(cables).map(c => {
+            const name = `${c.cable}${c.section ? " " + c.section + "мм²" : ""}${c.cores ? " " + c.cores + "ж" : ""}`;
+            return `<tr><td>${name}</td><td>${c.length.toFixed(2)}</td><td>${(c.length * reserveFactor).toFixed(2)}</td></tr>`;
+          }).join("")}</tbody></table>`;
+
+      specSummary.innerHTML = `
+        <div class="summary-card">
+          <h4>Устройства</h4>
+          <div class="muted-sub">Количество установок</div>
+          <div>Розеток: ${socketsCount}</div>
+          <div>Выключателей: ${switchesCount}</div>
+          <div>Светильников: ${lightsCount}</div>
+          <div>Выводов: ${cableoutsCount}</div>
+          <div>Распредкоробок: ${boxesCount}</div>
+          <div>Щитков: ${panelsCount}</div>
+        </div>
+        <div class="summary-card">
+          <h4>Кабель</h4>
+          <div class="muted-sub">Сводка с запасом ${reserve}%</div>
+          ${cableTable}
+          <div class="muted-sub" style="margin-top:4px;">Итого: ${totalCableWithReserve.toFixed(2)} м</div>
+        </div>`;
+    }
+
+    function rebuildAllSummaries() {
+      rebuildGroupsTable();
+      rebuildSpecSummary();
+    }
+
     // зум
     svg.addEventListener("wheel", evt => {
       evt.preventDefault();
@@ -1814,11 +2568,7 @@
         p.rectEl.setAttribute("x", q.x - 7);
         p.rectEl.setAttribute("y", q.y - 7);
       });
-      state.boxes.forEach(b => {
-        const q = worldToSvg({ x: b.xM, y: b.yM });
-        b.rectEl.setAttribute("x", q.x - 4);
-        b.rectEl.setAttribute("y", q.y - 4);
-      });
+      state.boxes.forEach(b => updateBoxGraphics(b));
       state.wires.forEach(w => updateWirePolyline(w));
       if (state.wireDrawing) updateTempWirePolyline();
     }
@@ -1857,7 +2607,9 @@
     });
 
     svg.addEventListener("mousemove", evt => {
-      if (state.dragging) {
+      if (state.wireEdit && state.wireEdit.draggingIdx != null) {
+        handleWireVertexDrag(evt);
+      } else if (state.dragging) {
         handleDragMove(evt);
       } else if (state.panning) {
         const dxPx = evt.clientX - state.panning.startX;
@@ -1871,11 +2623,19 @@
     svg.addEventListener("mouseup", () => {
       state.panning = null;
       stopDrag();
+      if (state.wireEdit) {
+        state.wireEdit.handles.forEach(h => h.el.classList.remove("dragging"));
+        state.wireEdit.draggingIdx = null;
+      }
     });
 
     svg.addEventListener("mouseleave", () => {
       state.panning = null;
       stopDrag();
+      if (state.wireEdit) {
+        state.wireEdit.handles.forEach(h => h.el.classList.remove("dragging"));
+        state.wireEdit.draggingIdx = null;
+      }
     });
 
     svg.addEventListener("contextmenu", evt => evt.preventDefault());
