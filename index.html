@@ -613,7 +613,7 @@
       sockets: [],  // {id,xM,yM,name,heightM,powerKW,group,circleEl,extraEls,type:"socket"/"switch"/"cableout"/"light"}
       panels: [],   // {id,xM,yM,name,heightM,rectEl}
       wires: [],    // {id,lineId,pointsM,polylineEl,fromType,fromId,toType,toId,group,cable,section,cores}
-      boxes: [],    // {id,lineId,xM,yM,heightM,group,rectEl,linePosRatio?,wireId?}
+      boxes: [],    // {id,lineId,xM,yM,heightM,group,rectEl,linePosRatio?,linePosOffset?,wireId?}
       nextId: 1,
       selected: null,
       roomDrawing: null,
@@ -979,6 +979,7 @@
         heightM: boxData.heightM,
         group: boxData.group || "",
         linePosRatio: typeof boxData.linePosRatio === "number" ? boxData.linePosRatio : null,
+        linePosOffset: typeof boxData.linePosOffset === "number" ? boxData.linePosOffset : null,
         wireId: boxData.wireId || null,
         rectEl: rect
       };
@@ -1063,6 +1064,7 @@
           heightM: b.heightM,
           group: b.group,
           linePosRatio: b.linePosRatio,
+          linePosOffset: b.linePosOffset,
           wireId: b.wireId
         })),
         wires: state.wires.map(w => ({
@@ -1651,6 +1653,7 @@
         heightM: roomH,
         group: groupName || "",
         linePosRatio: null,
+        linePosOffset: null,
         wireId: anchorWire ? anchorWire.id : null,
         rectEl: rect
       };
@@ -1675,6 +1678,7 @@
       const totalLen = Math.max(calcPlanLength(wire.pointsM), 1e-9);
       const ratio = Math.max(0, Math.min(1, proj.distanceAlong / totalLen));
       boxObj.linePosRatio = ratio;
+      boxObj.linePosOffset = proj.distanceAlong;
       boxObj.wireId = wire.id;
       boxObj.xM = proj.point.x;
       boxObj.yM = proj.point.y;
@@ -1701,12 +1705,16 @@
       state.boxes
         .filter(b => b.lineId === wire.lineId && (!b.wireId || b.wireId === wire.id))
         .forEach(b => {
-          const ratio = b.linePosRatio != null ? b.linePosRatio : 0;
-          const dist = totalLen * ratio;
-          const pt = pointAtDistanceOnPolyline(wire.pointsM, dist);
+          const offset = (typeof b.linePosOffset === "number" && isFinite(b.linePosOffset))
+            ? b.linePosOffset
+            : (b.linePosRatio != null ? b.linePosRatio * totalLen : 0);
+          const clamped = Math.max(0, Math.min(totalLen, offset));
+          const pt = pointAtDistanceOnPolyline(wire.pointsM, clamped);
           b.xM = pt.x;
           b.yM = pt.y;
           b.wireId = wire.id;
+          b.linePosOffset = clamped;
+          b.linePosRatio = totalLen > 0 ? clamped / totalLen : 0;
           updateBoxGraphics(b);
           refreshBranchWiresForBox(b);
         });
@@ -1718,7 +1726,7 @@
           ? state.wires.find(w => w.id === box.wireId)
           : state.wires.find(w => w.lineId === box.lineId);
         if (!wire) return;
-        if (box.linePosRatio == null) {
+        if (box.linePosOffset == null && box.linePosRatio == null) {
           attachBoxToWire(box, wire);
         } else {
           repositionBoxesForWire(wire);
@@ -2022,6 +2030,30 @@
       }
     }
 
+    function moveAttachedBoxesWithDevice(type, id, delta) {
+      if (!delta || (Math.abs(delta.x) < 1e-9 && Math.abs(delta.y) < 1e-9)) return;
+      const moved = new Set();
+      state.wires.forEach(w => {
+        let boxId = null;
+        if (w.fromType === type && w.fromId === id && w.toType === "box") boxId = w.toId;
+        if (w.toType === type && w.toId === id && w.fromType === "box") boxId = w.fromId;
+        if (!boxId || moved.has(boxId)) return;
+        const box = findById("box", boxId);
+        if (!box) return;
+        const newPos = snapToGrid({ x: box.xM + delta.x, y: box.yM + delta.y });
+        const room = findRoomContainingPoint(newPos);
+        if (!room) return;
+        const oldPt = { x: box.xM, y: box.yM };
+        box.xM = newPos.x;
+        box.yM = newPos.y;
+        updateBoxGraphics(box);
+        const anchorWire = box.wireId ? state.wires.find(x => x.id === box.wireId) : w;
+        if (anchorWire) attachBoxToWire(box, anchorWire);
+        recalcLinesForDevice("box", box.id, oldPt);
+        moved.add(boxId);
+      });
+    }
+
     function recalcLinesForDevice(type, id, oldPt) {
       const st = state.gridStepM;
       state.wires.forEach(w => {
@@ -2085,6 +2117,8 @@
       }
       // Пересчёт всех линий, связанных с этим устройством
       recalcLinesForDevice(type, id, oldPt);
+      const delta = { x: newPt.x - oldPt.x, y: newPt.y - oldPt.y };
+      moveAttachedBoxesWithDevice(type, id, delta);
     }
     function stopDrag() { state.dragging = null; }
 
